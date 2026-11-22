@@ -1,0 +1,13 @@
+name: Legacy Android APK build (manual only)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  legacy-disabled:
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Production Android builds now use flutter-android-final-stable.yml"

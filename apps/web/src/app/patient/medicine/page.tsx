@@ -1,0 +1,2 @@
+import {PatientShell} from "@/components/PatientShell";import {MedicineClient} from "@/components/MedicineClient";import {getServerLocale} from "@/lib/i18n-server";import {t} from "@/lib/i18n";
+export default async function Medicine(){const locale=await getServerLocale();return <PatientShell locale={locale}><div className="eyebrow">{t(locale,"medicine.eyebrow")}</div><h1 className="mobile-title">{t(locale,"medicine.title")}</h1><p className="muted">{t(locale,"medicine.lead")}</p><MedicineClient/></PatientShell>}

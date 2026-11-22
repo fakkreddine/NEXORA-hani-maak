@@ -1,0 +1,605 @@
+name: Build Hani Maak Final Stable APK
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - "apps/mobile/**"
+      - ".github/workflows/flutter-android-final-stable.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hani-maak-final-stable-apk
+  cancel-in-progress: true
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+    timeout-minutes: 35
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Install Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          channel: stable
+          cache: true
+
+      - name: Generate Android host
+        working-directory: apps/mobile
+        run: |
+          flutter create --platforms=android --project-name hani_maak_mobile --org com.hanimaak .
+          rm -f test/widget_test.dart
+
+      - name: Configure stable native Android services
+        working-directory: apps/mobile
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+
+          manifest = Path("android/app/src/main/AndroidManifest.xml")
+          text = manifest.read_text()
+          permissions = """<uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
+              <uses-permission android:name="android.permission.CAMERA" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              """
+          if "android.permission.RECORD_AUDIO" not in text:
+              text = text.replace(">\n    <application", ">\n    " + permissions + "<application", 1)
+
+          text = text.replace('android:label="hani_maak_mobile"', 'android:label="Hani Maak"')
+          if 'android:roundIcon=' not in text:
+              text = text.replace(
+                  'android:icon="@mipmap/ic_launcher"',
+                  'android:icon="@mipmap/ic_launcher"\n        android:roundIcon="@mipmap/ic_launcher_round"',
+              )
+
+          # Replace every default Flutter launcher asset with the official
+          # Hani ribbon/heart mark. Modern Android uses an adaptive icon while
+          # older launchers fall back to the vector legacy icon.
+          drawable_dir = Path("android/app/src/main/res/drawable")
+          drawable_dir.mkdir(parents=True, exist_ok=True)
+          (drawable_dir / "hani_launcher_legacy.xml").write_text("""<?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path android:fillColor="#157BE6"
+                  android:pathData="M54,4 A50,50 0,1 0,54,104 A50,50 0,1 0,54,4" />
+              <path android:fillColor="@android:color/transparent"
+                  android:strokeColor="@android:color/white"
+                  android:strokeWidth="9"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:pathData="M56,81 C39,65 8,61 9,37 C10,17 33,16 53,40 C68,57 70,72 56,81" />
+              <path android:fillColor="@android:color/transparent"
+                  android:strokeColor="@android:color/white"
+                  android:strokeWidth="9"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:pathData="M53,40 C66,17 90,12 98,34 C106,59 82,84 56,81" />
+          </vector>
+          """)
+          (drawable_dir / "hani_launcher_foreground.xml").write_text("""<?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path android:fillColor="@android:color/transparent"
+                  android:strokeColor="@android:color/white"
+                  android:strokeWidth="8"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:pathData="M56,81 C39,65 8,61 9,37 C10,17 33,16 53,40 C68,57 70,72 56,81" />
+              <path android:fillColor="@android:color/transparent"
+                  android:strokeColor="@android:color/white"
+                  android:strokeWidth="8"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:pathData="M53,40 C66,17 90,12 98,34 C106,59 82,84 56,81" />
+          </vector>
+          """)
+          (drawable_dir / "hani_launcher_background.xml").write_text("""<?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp"
+              android:height="108dp"
+              android:viewportWidth="108"
+              android:viewportHeight="108">
+              <path android:fillColor="#157BE6" android:pathData="M0,0h108v108h-108z" />
+          </vector>
+          """)
+
+          mipmap = Path("android/app/src/main/res/mipmap")
+          mipmap.mkdir(parents=True, exist_ok=True)
+          (mipmap / "ic_launcher.xml").write_text("""<?xml version="1.0" encoding="utf-8"?>
+          <inset xmlns:android="http://schemas.android.com/apk/res/android"
+              android:drawable="@drawable/hani_launcher_legacy"
+              android:inset="0dp" />
+          """)
+          (mipmap / "ic_launcher_round.xml").write_text("""<?xml version="1.0" encoding="utf-8"?>
+          <inset xmlns:android="http://schemas.android.com/apk/res/android"
+              android:drawable="@drawable/hani_launcher_legacy"
+              android:inset="0dp" />
+          """)
+
+          adaptive = Path("android/app/src/main/res/mipmap-anydpi-v26")
+          adaptive.mkdir(parents=True, exist_ok=True)
+          adaptive_xml = """<?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/hani_launcher_background" />
+              <foreground android:drawable="@drawable/hani_launcher_foreground" />
+          </adaptive-icon>
+          """
+          (adaptive / "ic_launcher.xml").write_text(adaptive_xml)
+          (adaptive / "ic_launcher_round.xml").write_text(adaptive_xml)
+
+          adaptive33 = Path("android/app/src/main/res/mipmap-anydpi-v33")
+          adaptive33.mkdir(parents=True, exist_ok=True)
+          adaptive33_xml = """<?xml version="1.0" encoding="utf-8"?>
+          <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+              <background android:drawable="@drawable/hani_launcher_background" />
+              <foreground android:drawable="@drawable/hani_launcher_foreground" />
+              <monochrome android:drawable="@drawable/hani_launcher_foreground" />
+          </adaptive-icon>
+          """
+          (adaptive33 / "ic_launcher.xml").write_text(adaptive33_xml)
+          (adaptive33 / "ic_launcher_round.xml").write_text(adaptive33_xml)
+
+          receivers = """
+              <receiver
+                  android:name=".HaniNotificationReceiver"
+                  android:exported="false" />
+              <receiver
+                  android:name=".HaniMaakWidgetProvider"
+                  android:exported="true">
+                  <intent-filter>
+                      <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+                  </intent-filter>
+                  <meta-data
+                      android:name="android.appwidget.provider"
+                      android:resource="@xml/hani_maak_widget_info" />
+              </receiver>
+          """
+          if "HaniNotificationReceiver" not in text:
+              text = text.replace("</application>", receivers + "\n    </application>")
+          manifest.write_text(text)
+
+          drawable = Path("android/app/src/main/res/drawable/hani_notification.xml")
+          drawable.parent.mkdir(parents=True, exist_ok=True)
+          drawable.write_text("""<?xml version="1.0" encoding="utf-8"?>
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="24dp"
+              android:height="24dp"
+              android:viewportWidth="24"
+              android:viewportHeight="24">
+              <path
+                  android:fillColor="@android:color/transparent"
+                  android:strokeColor="@android:color/white"
+                  android:strokeWidth="2.2"
+                  android:strokeLineCap="round"
+                  android:strokeLineJoin="round"
+                  android:pathData="M12.4,18 C8.7,14.4 2,13.5 2.2,8.2 C2.4,3.8 7.3,3.5 11.8,8.9 C15.1,12.6 15.5,16 12.4,18 M11.8,8.9 C14.6,3.7 20,2.7 21.6,7.6 C23.4,13.2 18,18.6 12.4,18" />
+          </vector>
+          """)
+
+          layout = Path("android/app/src/main/res/layout/hani_maak_widget.xml")
+          layout.parent.mkdir(parents=True, exist_ok=True)
+          layout.write_text("""<?xml version="1.0" encoding="utf-8"?>
+          <LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+              android:id="@+id/widget_root"
+              android:layout_width="match_parent"
+              android:layout_height="match_parent"
+              android:orientation="vertical"
+              android:padding="14dp"
+              android:background="#F5FAFF">
+              <LinearLayout
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:gravity="center_vertical"
+                  android:orientation="horizontal">
+                  <TextView
+                      android:layout_width="0dp"
+                      android:layout_height="wrap_content"
+                      android:layout_weight="1"
+                      android:text="Hani Maak"
+                      android:textColor="#0849B4"
+                      android:textStyle="bold"
+                      android:textSize="17sp" />
+                  <TextView
+                      android:id="@+id/widget_call_hani"
+                      android:layout_width="wrap_content"
+                      android:layout_height="36dp"
+                      android:gravity="center"
+                      android:minWidth="92dp"
+                      android:paddingStart="12dp"
+                      android:paddingEnd="12dp"
+                      android:background="#157BE6"
+                      android:text="Call Hani"
+                      android:textColor="#FFFFFF"
+                      android:textStyle="bold"
+                      android:textSize="12sp" />
+              </LinearLayout>
+              <TextView
+                  android:id="@+id/widget_patient"
+                  android:layout_width="wrap_content"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="7dp"
+                  android:textColor="#12324A"
+                  android:textStyle="bold"
+                  android:textSize="14sp" />
+              <TextView
+                  android:id="@+id/widget_medication"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="7dp"
+                  android:maxLines="1"
+                  android:ellipsize="end"
+                  android:textColor="#42647E"
+                  android:textSize="12sp" />
+              <TextView
+                  android:id="@+id/widget_appointment"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="3dp"
+                  android:maxLines="1"
+                  android:ellipsize="end"
+                  android:textColor="#42647E"
+                  android:textSize="12sp" />
+              <TextView
+                  android:id="@+id/widget_status"
+                  android:layout_width="match_parent"
+                  android:layout_height="wrap_content"
+                  android:layout_marginTop="5dp"
+                  android:textColor="#1899EC"
+                  android:textStyle="bold"
+                  android:textSize="11sp" />
+          </LinearLayout>
+          """)
+
+          info = Path("android/app/src/main/res/xml/hani_maak_widget_info.xml")
+          info.parent.mkdir(parents=True, exist_ok=True)
+          info.write_text("""<?xml version="1.0" encoding="utf-8"?>
+          <appwidget-provider xmlns:android="http://schemas.android.com/apk/res/android"
+              android:minWidth="250dp"
+              android:minHeight="125dp"
+              android:updatePeriodMillis="1800000"
+              android:initialLayout="@layout/hani_maak_widget"
+              android:resizeMode="horizontal|vertical"
+              android:widgetCategory="home_screen" />
+          """)
+
+          kotlin_dir = Path("android/app/src/main/kotlin/com/hanimaak/hani_maak_mobile")
+          kotlin_dir.mkdir(parents=True, exist_ok=True)
+
+          (kotlin_dir / "MainActivity.kt").write_text(r"""package com.hanimaak.hani_maak_mobile
+
+          import android.Manifest
+          import android.app.AlarmManager
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.appwidget.AppWidgetManager
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import io.flutter.embedding.android.FlutterActivity
+          import io.flutter.embedding.engine.FlutterEngine
+          import io.flutter.plugin.common.MethodChannel
+
+          class MainActivity : FlutterActivity() {
+              private val channelName = "com.hanimaak/native"
+              private var methodChannel: MethodChannel? = null
+              private var pendingRoute: String? = null
+
+              override fun configureFlutterEngine(flutterEngine: FlutterEngine) {
+                  super.configureFlutterEngine(flutterEngine)
+                  pendingRoute = intent?.getStringExtra("route")
+                  methodChannel = MethodChannel(
+                      flutterEngine.dartExecutor.binaryMessenger,
+                      channelName
+                  )
+                  methodChannel?.setMethodCallHandler { call, result ->
+                      when (call.method) {
+                          "initializeNotifications" -> {
+                              createChannels()
+                              result.success(null)
+                          }
+                          "getInitialNotificationRoute" -> {
+                              val route = pendingRoute
+                              pendingRoute = null
+                              result.success(route)
+                          }
+                          "requestNotificationPermission" -> {
+                              if (Build.VERSION.SDK_INT >= 33 &&
+                                  checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                              ) {
+                                  requestPermissions(
+                                      arrayOf(Manifest.permission.POST_NOTIFICATIONS),
+                                      4401
+                                  )
+                              }
+                              result.success(null)
+                          }
+                          "showTestNotification" -> {
+                              createChannels()
+                              HaniNotificationReceiver.showNotification(
+                                  this,
+                                  777001,
+                                  call.argument<String>("title") ?: "Hani Maak",
+                                  call.argument<String>("body") ?: "",
+                                  call.argument<String>("route") ?: "/notifications"
+                              )
+                              result.success(null)
+                          }
+                          "scheduleNotification" -> {
+                              scheduleNotification(
+                                  call.argument<Int>("id") ?: 0,
+                                  call.argument<String>("title") ?: "Hani Maak",
+                                  call.argument<String>("body") ?: "",
+                                  call.argument<Number>("whenMs")?.toLong() ?: 0L,
+                                  call.argument<String>("route") ?: "/today"
+                              )
+                              result.success(null)
+                          }
+                          "updateWidget" -> {
+                              val prefs = getSharedPreferences("hani_widget", Context.MODE_PRIVATE)
+                              prefs.edit()
+                                  .putString("patient_name", call.argument<String>("patientName") ?: "Patient")
+                                  .putString("next_medication", call.argument<String>("nextMedication") ?: "No medication due")
+                                  .putString("next_appointment", call.argument<String>("nextAppointment") ?: "No upcoming appointment")
+                                  .putInt("open_tasks", call.argument<Int>("openTasks") ?: 0)
+                                  .putString("care_status", call.argument<String>("careStatus") ?: "Care plan up to date")
+                                  .putString("language", call.argument<String>("language") ?: "en")
+                                  .putString("tasks_label", call.argument<String>("tasksLabel") ?: "tasks")
+                                  .putString("call_label", call.argument<String>("callLabel") ?: "Call Hani")
+                                  .apply()
+                              HaniMaakWidgetProvider.refreshAll(this)
+                              result.success(null)
+                          }
+                          "requestPinWidget" -> {
+                              if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                                  val manager = getSystemService(AppWidgetManager::class.java)
+                                  val provider = ComponentName(this, HaniMaakWidgetProvider::class.java)
+                                  if (manager.isRequestPinAppWidgetSupported) {
+                                      result.success(manager.requestPinAppWidget(provider, null, null))
+                                  } else {
+                                      result.success(false)
+                                  }
+                              } else {
+                                  result.success(false)
+                              }
+                          }
+                          else -> result.notImplemented()
+                      }
+                  }
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  setIntent(intent)
+                  val route = intent.getStringExtra("route")
+                  if (!route.isNullOrBlank()) {
+                      methodChannel?.invokeMethod("notificationRoute", route)
+                  }
+              }
+
+              private fun createChannels() {
+                  if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) return
+                  val manager = getSystemService(NotificationManager::class.java)
+                  manager.createNotificationChannel(
+                      NotificationChannel(
+                          "hani_care",
+                          "Hani Maak care reminders",
+                          NotificationManager.IMPORTANCE_HIGH
+                      ).apply {
+                          description = "Medication, appointments and caregiver reminders."
+                      }
+                  )
+              }
+
+              private fun scheduleNotification(
+                  id: Int,
+                  title: String,
+                  body: String,
+                  whenMs: Long,
+                  route: String
+              ) {
+                  if (whenMs <= System.currentTimeMillis()) return
+                  val intent = Intent(this, HaniNotificationReceiver::class.java).apply {
+                      putExtra("id", id)
+                      putExtra("title", title)
+                      putExtra("body", body)
+                      putExtra("route", route)
+                  }
+                  val pending = PendingIntent.getBroadcast(
+                      this,
+                      id,
+                      intent,
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val alarm = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                  alarm.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, whenMs, pending)
+              }
+          }
+          """)
+
+          (kotlin_dir / "HaniNotificationReceiver.kt").write_text(r"""package com.hanimaak.hani_maak_mobile
+
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import androidx.core.app.NotificationCompat
+
+          class HaniNotificationReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  showNotification(
+                      context,
+                      intent.getIntExtra("id", 0),
+                      intent.getStringExtra("title") ?: "Hani Maak",
+                      intent.getStringExtra("body") ?: "",
+                      intent.getStringExtra("route") ?: "/today"
+                  )
+              }
+
+              companion object {
+                  fun showNotification(
+                      context: Context,
+                      id: Int,
+                      title: String,
+                      body: String,
+                      route: String
+                  ) {
+                      val launch = Intent(context, MainActivity::class.java).apply {
+                          flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                          putExtra("route", route)
+                      }
+                      val pending = PendingIntent.getActivity(
+                          context,
+                          id,
+                          launch,
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                      )
+                      val notification = NotificationCompat.Builder(context, "hani_care")
+                          .setSmallIcon(R.drawable.hani_notification)
+                          .setContentTitle(title)
+                          .setContentText(body)
+                          .setStyle(NotificationCompat.BigTextStyle().bigText(body))
+                          .setPriority(NotificationCompat.PRIORITY_HIGH)
+                          .setAutoCancel(true)
+                          .setContentIntent(pending)
+                          .build()
+                      val manager = context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                      manager.notify(id, notification)
+                  }
+              }
+          }
+          """)
+
+          (kotlin_dir / "HaniMaakWidgetProvider.kt").write_text(r"""package com.hanimaak.hani_maak_mobile
+
+          import android.app.PendingIntent
+          import android.appwidget.AppWidgetManager
+          import android.appwidget.AppWidgetProvider
+          import android.content.ComponentName
+          import android.content.Context
+          import android.content.Intent
+          import android.widget.RemoteViews
+
+          class HaniMaakWidgetProvider : AppWidgetProvider() {
+              override fun onUpdate(
+                  context: Context,
+                  appWidgetManager: AppWidgetManager,
+                  appWidgetIds: IntArray
+              ) {
+                  appWidgetIds.forEach { updateOne(context, appWidgetManager, it) }
+              }
+
+              companion object {
+                  private fun updateOne(
+                      context: Context,
+                      manager: AppWidgetManager,
+                      widgetId: Int
+                  ) {
+                      val prefs = context.getSharedPreferences("hani_widget", Context.MODE_PRIVATE)
+                      val views = RemoteViews(context.packageName, R.layout.hani_maak_widget)
+                      views.setTextViewText(R.id.widget_patient, prefs.getString("patient_name", "Patient"))
+                      views.setTextViewText(R.id.widget_medication, prefs.getString("next_medication", "No medication due"))
+                      views.setTextViewText(R.id.widget_appointment, prefs.getString("next_appointment", "No upcoming appointment"))
+                      val tasks = prefs.getInt("open_tasks", 0)
+                      val tasksLabel = prefs.getString("tasks_label", "tasks") ?: "tasks"
+                      val status = prefs.getString("care_status", "Care plan up to date")
+                      val callLabel = prefs.getString("call_label", "Call Hani") ?: "Call Hani"
+                      views.setTextViewText(R.id.widget_status, "$tasks $tasksLabel · $status")
+                      views.setTextViewText(R.id.widget_call_hani, callLabel)
+
+                      val launch = Intent(context, MainActivity::class.java).apply {
+                          flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                          putExtra("route", "/today")
+                      }
+                      val openPending = PendingIntent.getActivity(
+                          context,
+                          widgetId,
+                          launch,
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                      )
+                      views.setOnClickPendingIntent(R.id.widget_root, openPending)
+
+                      val voiceLaunch = Intent(context, MainActivity::class.java).apply {
+                          flags = Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP
+                          putExtra("route", "/voice")
+                      }
+                      val voicePending = PendingIntent.getActivity(
+                          context,
+                          100000 + widgetId,
+                          voiceLaunch,
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                      )
+                      views.setOnClickPendingIntent(R.id.widget_call_hani, voicePending)
+                      manager.updateAppWidget(widgetId, views)
+                  }
+
+                  fun refreshAll(context: Context) {
+                      val manager = AppWidgetManager.getInstance(context)
+                      val component = ComponentName(context, HaniMaakWidgetProvider::class.java)
+                      val ids = manager.getAppWidgetIds(component)
+                      ids.forEach { updateOne(context, manager, it) }
+                  }
+              }
+          }
+          """)
+
+          gradle = Path("android/app/build.gradle.kts")
+          if gradle.exists():
+              g = gradle.read_text()
+              g = g.replace("minSdk = flutter.minSdkVersion", "minSdk = 23")
+              g = g.replace("JavaVersion.VERSION_1_8", "JavaVersion.VERSION_11")
+              g = g.replace('JvmTarget.JVM_1_8', 'JvmTarget.JVM_11')
+              gradle.write_text(g)
+          PY
+
+      - name: Resolve Flutter dependencies
+        working-directory: apps/mobile
+        run: flutter pub get
+
+      - name: Analyze mobile app
+        working-directory: apps/mobile
+        run: flutter analyze --no-fatal-infos --no-fatal-warnings
+
+      - name: Build release APK
+        working-directory: apps/mobile
+        run: |
+          flutter build apk --release             --dart-define=HANI_API_BASE=https://hani-maak.vercel.app             --dart-define=SUPABASE_URL=https://lhrngmuxmjpigycgonnh.supabase.co             --dart-define=SUPABASE_PUBLISHABLE_KEY=sb_publishable_8jxBjLqsE0-8fSxaCZqP7w_7LdAm4SI
+
+      - name: Prepare final APK
+        run: |
+          mkdir -p dist
+          cp apps/mobile/build/app/outputs/flutter-apk/app-release.apk dist/Hani-Maak-Final-Stable.apk
+          sha256sum dist/Hani-Maak-Final-Stable.apk > dist/Hani-Maak-Final-Stable.apk.sha256
+
+      - name: Upload final APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: hani-maak-final-stable-apk
+          path: |
+            dist/Hani-Maak-Final-Stable.apk
+            dist/Hani-Maak-Final-Stable.apk.sha256
+          retention-days: 30
+          if-no-files-found: error

@@ -1,0 +1,1114 @@
+import { NextResponse } from "next/server";
+import { canPerformCaregiverAction, canSeeIncident, mayRequestProfessionalHelp } from "@/lib/caregiver-permissions";
+
+export const dynamic = "force-dynamic";
+
+type Json = Record<string, any>;
+
+const supabaseUrl = (process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL)?.replace(/\/$/, "");
+const supabaseKey = process.env.SUPABASE_SECRET_KEY || process.env.SUPABASE_SERVICE_ROLE_KEY;
+
+const cors = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET,POST,OPTIONS",
+  "Access-Control-Allow-Headers": "authorization,content-type",
+  "Access-Control-Max-Age": "86400",
+};
+
+function json(body: unknown, init?: ResponseInit) {
+  const response = NextResponse.json(body, init);
+  Object.entries(cors).forEach(([k, v]) => response.headers.set(k, v));
+  return response;
+}
+
+export async function OPTIONS() {
+  return new Response(null, { status: 204, headers: cors });
+}
+
+function clean(value: unknown, max = 1200) {
+  return String(value ?? "").trim().slice(0, max);
+}
+
+function restHeaders(extra: Record<string, string> = {}) {
+  if (!supabaseKey) throw new Error("supabase_secret_missing");
+  const h: Record<string, string> = {
+    apikey: supabaseKey,
+    "content-type": "application/json",
+    ...extra,
+  };
+  if (!supabaseKey.startsWith("sb_secret_") && !supabaseKey.startsWith("sb_publishable_")) {
+    h.Authorization = `Bearer ${supabaseKey}`;
+  }
+  return h;
+}
+
+async function sb(path: string, init: RequestInit = {}) {
+  if (!supabaseUrl || !supabaseKey) throw new Error("supabase_not_configured");
+  const response = await fetch(`${supabaseUrl}/rest/v1/${path}`, {
+    ...init,
+    headers: {
+      ...restHeaders(),
+      ...(init.headers as Record<string, string> | undefined),
+    },
+    cache: "no-store",
+  });
+  const raw = await response.text();
+  const body = raw ? JSON.parse(raw) : null;
+  if (!response.ok) throw new Error(body?.message || body?.error || `supabase_http_${response.status}`);
+  return body;
+}
+
+async function first(path: string) {
+  const rows = await sb(path);
+  return Array.isArray(rows) ? rows[0] ?? null : null;
+}
+
+async function verifyIdentity(req: Request, caregiverId: string, patientId: string) {
+  const auth = req.headers.get("authorization") || "";
+  if (!auth.startsWith("Bearer ")) throw new Error("authentication_required");
+  if (!supabaseUrl || !supabaseKey) throw new Error("supabase_not_configured");
+
+  const userResponse = await fetch(`${supabaseUrl}/auth/v1/user`, {
+    headers: { apikey: supabaseKey, Authorization: auth },
+    cache: "no-store",
+  });
+  if (!userResponse.ok) throw new Error("invalid_session");
+  const user = await userResponse.json();
+
+  const profile = await first(
+    `profiles?select=id&auth_user_id=eq.${encodeURIComponent(user.id)}&id=eq.${encodeURIComponent(caregiverId)}&limit=1`,
+  );
+  if (!profile) throw new Error("caregiver_identity_mismatch");
+  const relationship = await first(
+    `caregiver_patient_relationships?select=id&caregiver_profile_id=eq.${encodeURIComponent(caregiverId)}&patient_id=eq.${encodeURIComponent(patientId)}&access_status=eq.active&limit=1`,
+  );
+  if (!relationship) throw new Error("caregiver_patient_access_denied");
+}
+
+async function professionalRoutes(patientId: string) {
+  const connections = await sb(
+    `professional_connections?select=id,professional_id,connection_type,status&patient_id=eq.${encodeURIComponent(patientId)}&status=eq.active`,
+  ) as Json[];
+  const ids = connections.map((x) => x.professional_id).filter(Boolean);
+  if (!ids.length) return [];
+  const people = await sb(
+    `professional_profiles?select=id,full_name,specialty,facility_name,phone,whatsapp,booking_url,is_verified&id=in.(${ids.join(",")})`,
+  ) as Json[];
+  const map = new Map(people.map((p) => [p.id, p]));
+  return connections
+    .map((c) => ({ connection: c, professional: map.get(c.professional_id) }))
+    .filter((x) => x.professional?.is_verified === true);
+}
+
+async function loadContext(caregiverId: string, patientId: string) {
+  const relationship = await first(
+    `caregiver_patient_relationships?select=*&caregiver_profile_id=eq.${encodeURIComponent(caregiverId)}&patient_id=eq.${encodeURIComponent(patientId)}&access_status=eq.active&limit=1`,
+  );
+  if (!relationship) throw new Error("caregiver_patient_access_denied");
+
+  const [
+    caregiver,
+    patient,
+    medications,
+    instructions,
+    incidentRows,
+    tasks,
+    wellbeing,
+    circle,
+    notifications,
+    preferences,
+    timeline,
+    appointments,
+    supportSignals,
+    incomingRequests,
+    outgoingRequests,
+    questionnaireDefinitions,
+    medicationSchedules,
+    medicationEvents,
+    careDocuments,
+    memoryItems,
+    activitySessions,
+    summaryDeliveries,
+    recentVoiceEmotion,
+  ] = await Promise.all([
+    first(`profiles?select=id,full_name,preferred_language,timezone,role,avatar_url,metadata&id=eq.${encodeURIComponent(caregiverId)}&limit=1`),
+    first(`patients?select=id,display_name,preferred_name,date_of_birth,sex,alzheimer_stage,primary_language,important_notes,photo_url,is_demo&id=eq.${encodeURIComponent(patientId)}&limit=1`),
+    relationship.can_view_medications === true ? sb(`patient_medications?select=id,medication_name,dose_text,schedule_text,instructions,verified,active&patient_id=eq.${encodeURIComponent(patientId)}&active=eq.true`) : Promise.resolve([]),
+    sb(`professional_instructions?select=id,instruction_type,title,body,status,verified_at,professional_id,created_at&patient_id=eq.${encodeURIComponent(patientId)}&status=eq.active&order=created_at.desc`),
+    sb(`incidents?select=id,reported_by_profile_id,scenario_id,title,summary,occurred_at,support_level,visibility,created_at,shared_at,resolved_at&patient_id=eq.${encodeURIComponent(patientId)}&order=created_at.desc&limit=30`),
+    sb(`care_tasks?select=id,title,description,source,status,effort_weight,difficulty,starts_at,due_at,overnight,requested_by_profile_id,assigned_to_profile_id,created_at&patient_id=eq.${encodeURIComponent(patientId)}&order=due_at.asc.nullslast&limit=50`),
+    sb(`wellbeing_checkins?select=id,mood_label,energy_label,sleep_label,free_text,created_at&caregiver_profile_id=eq.${encodeURIComponent(caregiverId)}&order=created_at.desc&limit=30`),
+    first(`care_circles?select=id,name&patient_id=eq.${encodeURIComponent(patientId)}&limit=1`),
+    sb(`caregiver_notifications?select=id,category,title,body,action_type,action_payload,scheduled_for,delivered_at,opened_at,created_at&caregiver_profile_id=eq.${encodeURIComponent(caregiverId)}&order=created_at.desc&limit=30`),
+    first(`notification_preferences?select=*&caregiver_profile_id=eq.${encodeURIComponent(caregiverId)}&limit=1`),
+    sb(`timeline_events?select=id,event_type,title,summary,occurred_at,source_type,source_id,visible_to_care_circle,created_at&patient_id=eq.${encodeURIComponent(patientId)}&visible_to_care_circle=eq.true&order=occurred_at.desc&limit=50`),
+    sb(`caregiver_appointments?select=id,patient_id,requested_by_profile_id,professional_id,scheduled_for,reason,status,created_at&patient_id=eq.${encodeURIComponent(patientId)}&order=created_at.desc&limit=20`),
+    sb(`support_signals?select=id,signal_type,severity,confidence,evidence,experimental,created_at&caregiver_profile_id=eq.${encodeURIComponent(caregiverId)}&order=created_at.desc&limit=20`),
+    sb(`care_task_requests?select=id,task_id,requester_profile_id,recipient_profile_id,status,message,alternative_note,alternative_starts_at,responded_at,created_at&recipient_profile_id=eq.${encodeURIComponent(caregiverId)}&order=created_at.desc&limit=20`),
+    sb(`care_task_requests?select=id,task_id,requester_profile_id,recipient_profile_id,status,message,alternative_note,alternative_starts_at,responded_at,created_at&requester_profile_id=eq.${encodeURIComponent(caregiverId)}&order=created_at.desc&limit=20`),
+    sb("questionnaire_definitions?select=id,code,name,purpose,owner,active&active=eq.true&order=created_at.desc"),
+    relationship.can_view_medications === true ? sb(`medication_schedules?select=id,patient_medication_id,timezone,times,days_of_week,reminder_minutes_before,active,starts_on,ends_on,notes,created_at&patient_id=eq.${encodeURIComponent(patientId)}&active=eq.true&order=created_at.desc`) : Promise.resolve([]),
+    relationship.can_view_medications === true ? sb(`medication_events?select=id,patient_medication_id,scheduled_for,status,actual_at,note,source,created_at&patient_id=eq.${encodeURIComponent(patientId)}&order=scheduled_for.desc&limit=80`) : Promise.resolve([]),
+    sb(`care_documents?select=id,document_type,title,original_file_name,extracted_text,extraction_json,reviewed,created_at,updated_at&patient_id=eq.${encodeURIComponent(patientId)}&order=created_at.desc&limit=40`),
+    sb(`patient_memory_items?select=id,item_type,title,subtitle,image_url,media_url,prompt,sort_order,active,metadata,created_at&patient_id=eq.${encodeURIComponent(patientId)}&active=eq.true&order=sort_order.asc,created_at.asc`),
+    sb(`patient_activity_sessions?select=id,memory_item_id,activity_type,started_at,ended_at,response_label,note,metadata,created_at&patient_id=eq.${encodeURIComponent(patientId)}&order=started_at.desc&limit=40`),
+    sb(`summary_deliveries?select=id,channel,recipient,summary_type,status,summary_text,provider_message_id,error,created_at,sent_at&caregiver_profile_id=eq.${encodeURIComponent(caregiverId)}&patient_id=eq.${encodeURIComponent(patientId)}&order=created_at.desc&limit=20`),
+    first(`voice_emotion_analyses?select=id,conversation_id,status,dominant_emotion,confidence,distribution,audio_duration_ms,analyzed_speech_ms,segment_count,model_name,analysis_version,created_at,completed_at&caregiver_profile_id=eq.${encodeURIComponent(caregiverId)}&patient_id=eq.${encodeURIComponent(patientId)}&status=eq.completed&order=completed_at.desc.nullslast&limit=1`),
+  ]);
+
+  if (!patient) throw new Error("patient_not_found");
+
+  const incidents = (incidentRows as Json[]).filter(
+    (i) => canSeeIncident(relationship, caregiverId, i),
+  );
+
+  let members: Json[] = [];
+  if (circle?.id) {
+    const memberRows = await sb(
+      `care_circle_members?select=id,profile_id,member_role,status,joined_at&care_circle_id=eq.${encodeURIComponent(circle.id)}&status=eq.active`,
+    ) as Json[];
+    const ids = memberRows.map((m) => m.profile_id).filter(Boolean);
+    if (ids.length) {
+      const profiles = await sb(`profiles?select=id,full_name,avatar_url&id=in.(${ids.join(",")})`) as Json[];
+      const map = new Map(profiles.map((p) => [p.id, p]));
+      members = memberRows.map((m) => ({ ...m, profile: map.get(m.profile_id) ?? null }));
+    }
+  }
+
+  const questionnaires: Json[] = [];
+  for (const definition of questionnaireDefinitions as Json[]) {
+    const versions = await sb(
+      `questionnaire_versions?select=id,version_label,language,validation_status,validation_reference,active&questionnaire_id=eq.${definition.id}&active=eq.true&validation_status=eq.validated`,
+    ) as Json[];
+    questionnaires.push(...versions.map((version) => ({ ...version, definition })));
+  }
+
+  const taskById = new Map((tasks as Json[]).map((t) => [t.id, t]));
+  const allRequests = [...(incomingRequests as Json[]), ...(outgoingRequests as Json[])];
+  const requests = allRequests.map((r) => ({ ...r, task: taskById.get(r.task_id) ?? null }));
+
+  const patterns: Json[] = [];
+  const recentSeven = incidents.filter((i) => {
+    const d = new Date(i.occurred_at || i.created_at || 0).getTime();
+    return d > Date.now() - 7 * 24 * 60 * 60 * 1000;
+  });
+  const byScenario = new Map<string, number>();
+  for (const item of recentSeven) {
+    const key = String(item.scenario_id || item.title || "incident");
+    byScenario.set(key, (byScenario.get(key) || 0) + 1);
+  }
+  for (const [key, count] of byScenario) {
+    if (count >= 2) patterns.push({ type: "repeated_incident", key, count, windowDays: 7 });
+  }
+  const recentWellbeing = (wellbeing as Json[]).slice(0, 5);
+  const heavy = recentWellbeing.filter((w) =>
+    ["low", "poor", "tired", "overwhelmed", "exhausted"].includes(String(w.energy_label || w.sleep_label || w.mood_label || "").toLowerCase()),
+  ).length;
+  if (heavy >= 2) patterns.push({ type: "caregiver_strain", count: heavy, windowCount: recentWellbeing.length });
+
+  const now = Date.now();
+  const visibleNotifications = (notifications as Json[]).filter((n) => {
+    if (!n.scheduled_for) return true;
+    const scheduled = new Date(n.scheduled_for).getTime();
+    return Number.isNaN(scheduled) || scheduled <= now;
+  });
+  const followUp = visibleNotifications.find((n) =>
+    n.category === "incident_followup" && !n.opened_at,
+  ) ?? null;
+
+  return {
+    caregiver,
+    patient,
+    relationship,
+    medications,
+    professionalInstructions: instructions,
+    recentIncidents: incidents,
+    careTasks: tasks,
+    privateWellbeing: wellbeing,
+    careCircle: circle ? { ...circle, members } : null,
+    professionalRoutes: await professionalRoutes(patientId),
+    notifications: visibleNotifications,
+    notificationPreferences: preferences,
+    questionnaires,
+    timeline,
+    appointments,
+    supportSignals,
+    taskRequests: requests,
+    medicationSchedules,
+    medicationEvents,
+    careDocuments,
+    memoryItems,
+    activitySessions,
+    summaryDeliveries,
+    recentVoiceEmotion,
+    patterns,
+    followUp,
+  };
+}
+
+async function createCareTask(
+  caregiverId: string,
+  patientId: string,
+  args: Json,
+) {
+  const title = clean(args.title, 200);
+  if (!title) throw new Error("task_title_required");
+
+  const source = ["manual", "routine"].includes(clean(args.source, 40))
+    ? clean(args.source, 40)
+    : "manual";
+  const difficulty = ["light", "moderate", "heavy"].includes(clean(args.difficulty, 40))
+    ? clean(args.difficulty, 40)
+    : "moderate";
+  const effort = Number(args.effortWeight);
+  const effortWeight = Number.isFinite(effort) && effort > 0
+    ? Math.min(10, effort)
+    : 1;
+  const recipientProfileId = clean(args.recipientProfileId, 120) || null;
+
+  if (recipientProfileId) {
+    const circle = await first(
+      `care_circles?select=id&patient_id=eq.${encodeURIComponent(patientId)}&limit=1`,
+    );
+    if (!circle) throw new Error("care_circle_not_found");
+    const member = await first(
+      `care_circle_members?select=id&care_circle_id=eq.${circle.id}&profile_id=eq.${encodeURIComponent(recipientProfileId)}&status=eq.active&limit=1`,
+    );
+    if (!member) throw new Error("recipient_not_in_care_circle");
+  }
+
+  const taskRows = await sb("care_tasks", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({
+      patient_id: patientId,
+      title,
+      description: clean(args.description, 1000) || null,
+      source,
+      requested_by_profile_id: caregiverId,
+      assigned_to_profile_id: recipientProfileId ? null : caregiverId,
+      status: recipientProfileId ? "requested" : "open",
+      effort_weight: effortWeight,
+      difficulty,
+      due_at: args.dueAt || null,
+      overnight: args.overnight === true,
+      metadata: {
+        createdBy: "caregiver_app",
+        caregiverAdjustedEffort: true,
+      },
+    }),
+  });
+  const task = taskRows?.[0] ?? null;
+  if (!task?.id) throw new Error("task_creation_failed");
+
+  let request = null;
+  if (recipientProfileId) {
+    const requestRows = await sb("care_task_requests", {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({
+        task_id: task.id,
+        requester_profile_id: caregiverId,
+        recipient_profile_id: recipientProfileId,
+        status: "pending",
+        message: clean(args.message, 500) || title,
+      }),
+    });
+    request = requestRows?.[0] ?? null;
+
+    const preferences = await first(
+      `notification_preferences?select=enabled,care_circle_requests&caregiver_profile_id=eq.${encodeURIComponent(recipientProfileId)}&limit=1`,
+    );
+    if (preferences?.enabled !== false && preferences?.care_circle_requests !== false) {
+      await sb("caregiver_notifications", {
+        method: "POST",
+        headers: { Prefer: "return=minimal" },
+        body: JSON.stringify({
+          caregiver_profile_id: recipientProfileId,
+          category: "care_circle_request",
+          title: "Care Circle request",
+          body: title,
+          action_type: "open_care_circle",
+          action_payload: {
+            requestId: request?.id ?? null,
+            taskId: task.id,
+          },
+          scheduled_for: new Date().toISOString(),
+        }),
+      });
+    }
+  }
+
+  return { task, request };
+}
+
+async function respondTask(caregiverId: string, requestId: string, args: Json) {
+  const request = await first(
+    `care_task_requests?select=*&id=eq.${encodeURIComponent(requestId)}&recipient_profile_id=eq.${encodeURIComponent(caregiverId)}&limit=1`,
+  );
+  if (!request) throw new Error("task_request_not_found");
+  if (request.status !== "pending") throw new Error("task_request_already_resolved");
+
+  const response = clean(args.response, 40);
+  if (!["accepted", "declined", "alternative"].includes(response)) throw new Error("invalid_task_response");
+
+  const storedStatus = response === "alternative" ? "alternative_proposed" : response;
+  const patch: Json = {
+    status: storedStatus,
+    responded_at: new Date().toISOString(),
+  };
+  if (response === "alternative") {
+    patch.alternative_note = clean(args.alternativeNote, 500) || "Alternative proposed";
+    patch.alternative_starts_at = args.alternativeStartsAt || null;
+  }
+
+  const rows = await sb(`care_task_requests?id=eq.${encodeURIComponent(requestId)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify(patch),
+  });
+
+  if (response === "accepted") {
+    await sb(`care_tasks?id=eq.${encodeURIComponent(request.task_id)}`, {
+      method: "PATCH",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({ status: "accepted", assigned_to_profile_id: caregiverId, updated_at: new Date().toISOString() }),
+    });
+  }
+
+  return rows?.[0] ?? null;
+}
+
+function scoreQuestion(answer: unknown, rule: Json) {
+  const scores = (rule?.scores || rule?.option_scores || rule?.optionScores) as Json | undefined;
+  if (scores && answer != null && Object.prototype.hasOwnProperty.call(scores, String(answer))) {
+    const value = Number(scores[String(answer)]);
+    return Number.isFinite(value) ? value : 0;
+  }
+  if (typeof answer === "number" && Number.isFinite(answer)) {
+    const multiplier = Number(rule?.multiplier ?? 1);
+    return answer * (Number.isFinite(multiplier) ? multiplier : 1);
+  }
+  if (typeof answer === "boolean") {
+    const trueScore = Number(rule?.true ?? rule?.true_score ?? 1);
+    const falseScore = Number(rule?.false ?? rule?.false_score ?? 0);
+    return answer
+      ? (Number.isFinite(trueScore) ? trueScore : 1)
+      : (Number.isFinite(falseScore) ? falseScore : 0);
+  }
+  return 0;
+}
+
+function interpretScore(score: number, config: Json) {
+  const bands = Array.isArray(config?.bands) ? config.bands : [];
+  for (const band of bands) {
+    const min = Number(band?.min ?? Number.NEGATIVE_INFINITY);
+    const max = Number(band?.max ?? Number.POSITIVE_INFINITY);
+    if (score >= min && score <= max) {
+      return {
+        key: clean(band?.key, 120) || null,
+        text: clean(band?.text, 1200) || null,
+        trendLabel: clean(band?.trend_label ?? band?.trendLabel, 120) || null,
+        requiresProfessionalSupport: band?.requires_professional_support === true ||
+          band?.requiresProfessionalSupport === true,
+      };
+    }
+  }
+  return {
+    key: null,
+    text: null,
+    trendLabel: null,
+    requiresProfessionalSupport: false,
+  };
+}
+
+async function getQuestionnaire(versionId: string) {
+  const version = await first(
+    `questionnaire_versions?select=id,questionnaire_id,version_label,language,validation_status,validation_reference,scoring_config,interpretation_config,active&id=eq.${encodeURIComponent(versionId)}&active=eq.true&validation_status=eq.validated&limit=1`,
+  );
+  if (!version) throw new Error("validated_questionnaire_not_found");
+  const definition = await first(
+    `questionnaire_definitions?select=id,code,name,purpose,owner,active&id=eq.${encodeURIComponent(version.questionnaire_id)}&active=eq.true&limit=1`,
+  );
+  const questions = await sb(
+    `questionnaire_questions?select=id,display_order,prompt,response_type,options,scoring_rule,required&version_id=eq.${encodeURIComponent(versionId)}&order=display_order.asc`,
+  );
+  return { version, definition, questions };
+}
+
+async function submitQuestionnaire(
+  caregiverId: string,
+  patientId: string,
+  versionId: string,
+  answers: Json[],
+) {
+  const questionnaire = await getQuestionnaire(versionId);
+  const questions = questionnaire.questions as Json[];
+  const answerMap = new Map(answers.map((a) => [clean(a.questionId, 120), a.answer]));
+
+  for (const question of questions) {
+    if (question.required === true && !answerMap.has(String(question.id))) {
+      throw new Error("required_question_missing");
+    }
+  }
+
+  const sessionRows = await sb("questionnaire_sessions", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({
+      version_id: versionId,
+      caregiver_profile_id: caregiverId,
+      patient_id: patientId,
+      trigger_type: "manual",
+      status: "in_progress",
+      started_at: new Date().toISOString(),
+    }),
+  });
+  const session = sessionRows?.[0];
+  if (!session?.id) throw new Error("questionnaire_session_failed");
+
+  const answerRows = questions
+    .filter((q) => answerMap.has(String(q.id)))
+    .map((q) => ({
+      session_id: session.id,
+      question_id: q.id,
+      answer: { value: answerMap.get(String(q.id)) },
+    }));
+  if (answerRows.length) {
+    await sb("questionnaire_answers", {
+      method: "POST",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify(answerRows),
+    });
+  }
+
+  let score = 0;
+  let hasScoring = false;
+  for (const question of questions) {
+    if (!answerMap.has(String(question.id))) continue;
+    const rule = question.scoring_rule && typeof question.scoring_rule === "object"
+      ? question.scoring_rule
+      : {};
+    if (Object.keys(rule).length) hasScoring = true;
+    score += scoreQuestion(answerMap.get(String(question.id)), rule);
+  }
+
+  const interpretation = hasScoring
+    ? interpretScore(score, questionnaire.version.interpretation_config || {})
+    : {
+        key: null,
+        text: null,
+        trendLabel: null,
+        requiresProfessionalSupport: false,
+      };
+
+  const resultRows = await sb("questionnaire_results", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({
+      session_id: session.id,
+      raw_score: hasScoring ? score : null,
+      interpretation_key: interpretation.key,
+      interpretation_text: interpretation.text,
+      trend_label: interpretation.trendLabel,
+      requires_professional_support: interpretation.requiresProfessionalSupport,
+    }),
+  });
+
+  await sb(`questionnaire_sessions?id=eq.${encodeURIComponent(session.id)}`, {
+    method: "PATCH",
+    headers: { Prefer: "return=minimal" },
+    body: JSON.stringify({
+      status: "completed",
+      completed_at: new Date().toISOString(),
+    }),
+  });
+
+  return {
+    session: { ...session, status: "completed" },
+    result: resultRows?.[0] ?? null,
+    interpretationOnly: true,
+  };
+}
+
+async function updateAppPreferences(caregiverId: string, args: Json) {
+  const current = await first(
+    `profiles?select=id,preferred_language,metadata&id=eq.${encodeURIComponent(caregiverId)}&limit=1`,
+  );
+  if (!current) throw new Error("caregiver_profile_not_found");
+
+  const metadata = current.metadata && typeof current.metadata === "object"
+    ? { ...current.metadata }
+    : {};
+  const existing = metadata.app_preferences && typeof metadata.app_preferences === "object"
+    ? { ...metadata.app_preferences }
+    : {};
+
+  const requested = clean(args.language, 20).toLowerCase();
+  const preferredLanguage =
+    requested === "tn" ? "derja" :
+    ["ar", "fr", "en"].includes(requested) ? requested :
+    current.preferred_language || "derja";
+
+  metadata.app_preferences = {
+    ...existing,
+    language: requested || existing.language || preferredLanguage,
+    show_hani_widget: args.showHaniWidget !== false,
+    show_patient_widget: args.showPatientWidget !== false,
+    show_care_load_widget: args.showCareLoadWidget !== false,
+    show_wellbeing_widget: args.showWellbeingWidget !== false,
+  };
+
+  const rows = await sb(
+    `profiles?id=eq.${encodeURIComponent(caregiverId)}`,
+    {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({
+        preferred_language: preferredLanguage,
+        metadata,
+        updated_at: new Date().toISOString(),
+      }),
+    },
+  );
+  return rows?.[0] ?? null;
+}
+
+async function updatePreferences(caregiverId: string, args: Json) {
+  const payload: Json = {
+    caregiver_profile_id: caregiverId,
+    enabled: args.enabled !== false,
+    incident_followup: args.incidentFollowup !== false,
+    wellbeing_checkin: args.wellbeingCheckin !== false,
+    care_circle_requests: args.careCircleRequests !== false,
+    appointments: args.appointments !== false,
+    hydration: args.hydration === true,
+    nutrition: args.nutrition === true,
+    sleep: args.sleep === true,
+    movement: args.movement === true,
+    breathing: args.breathing === true,
+    social_connection: args.socialConnection === true,
+    quiet_hours_start: args.quietHours === false ? null : clean(args.quietHoursStart, 8) || "22:00",
+    quiet_hours_end: args.quietHours === false ? null : clean(args.quietHoursEnd, 8) || "07:00",
+    updated_at: new Date().toISOString(),
+  };
+  const rows = await sb("notification_preferences?on_conflict=caregiver_profile_id", {
+    method: "POST",
+    headers: { Prefer: "resolution=merge-duplicates,return=representation" },
+    body: JSON.stringify(payload),
+  });
+  return rows?.[0] ?? null;
+}
+
+
+async function registerPushToken(
+  caregiverId: string,
+  args: Json,
+) {
+  const platform = clean(args.platform, 30).toLowerCase();
+  const token = clean(args.token, 4096);
+  if (!["android", "ios"].includes(platform)) {
+    throw new Error("invalid_push_platform");
+  }
+  if (!token) throw new Error("push_token_required");
+
+  const rows = await sb(
+    `device_push_tokens?caregiver_profile_id=eq.${encodeURIComponent(caregiverId)}&platform=eq.${encodeURIComponent(platform)}&token=eq.${encodeURIComponent(token)}`,
+    {
+      method: "PATCH",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({
+        enabled: true,
+        last_seen_at: new Date().toISOString(),
+        metadata:
+          args.metadata && typeof args.metadata === "object"
+            ? args.metadata
+            : {},
+      }),
+    },
+  );
+
+  if (Array.isArray(rows) && rows.length) return rows[0];
+
+  const created = await sb("device_push_tokens", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({
+      caregiver_profile_id: caregiverId,
+      platform,
+      token,
+      enabled: true,
+      last_seen_at: new Date().toISOString(),
+      metadata:
+        args.metadata && typeof args.metadata === "object"
+          ? args.metadata
+          : {},
+    }),
+  });
+  return created?.[0] ?? null;
+}
+
+async function createMedication(
+  caregiverId: string,
+  patientId: string,
+  args: Json,
+) {
+  const name = clean(args.medicationName, 200);
+  if (!name) throw new Error("medication_name_required");
+
+  const medicationRows = await sb("patient_medications", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({
+      patient_id: patientId,
+      medication_name: name,
+      dose_text: clean(args.doseText, 200) || null,
+      schedule_text: clean(args.scheduleText, 300) || null,
+      instructions: clean(args.instructions, 1000) || null,
+      verified: args.verified === true,
+      active: true,
+      starts_on: args.startsOn || null,
+      ends_on: args.endsOn || null,
+      external_ids: {
+        source: clean(args.source, 40) || "manual",
+        reviewedByCaregiver: true,
+      },
+    }),
+  });
+  const medication = medicationRows?.[0];
+  if (!medication?.id) throw new Error("medication_creation_failed");
+
+  const times = Array.isArray(args.times)
+    ? args.times.map((x) => clean(x, 8)).filter(Boolean)
+    : [];
+  if (times.length) {
+    await sb("medication_schedules", {
+      method: "POST",
+      headers: { Prefer: "return=minimal" },
+      body: JSON.stringify({
+        patient_medication_id: medication.id,
+        patient_id: patientId,
+        created_by_profile_id: caregiverId,
+        timezone: clean(args.timezone, 80) || "Africa/Tunis",
+        times,
+        days_of_week: Array.isArray(args.daysOfWeek)
+          ? args.daysOfWeek
+          : [1,2,3,4,5,6,7],
+        reminder_minutes_before: Math.max(
+          0,
+          Math.min(240, Number(args.reminderMinutesBefore) || 0),
+        ),
+        active: true,
+        starts_on: args.startsOn || null,
+        ends_on: args.endsOn || null,
+        notes: clean(args.scheduleNotes, 500) || null,
+      }),
+    });
+  }
+
+  return medication;
+}
+
+async function recordMedicationEvent(
+  caregiverId: string,
+  patientId: string,
+  args: Json,
+) {
+  const medicationId = clean(args.medicationId, 120);
+  const status = clean(args.status, 40);
+  if (!medicationId) throw new Error("medication_required");
+  if (!["taken", "skipped", "delayed", "pending"].includes(status)) {
+    throw new Error("invalid_medication_status");
+  }
+  const medication = await first(
+    `patient_medications?select=id&patient_id=eq.${encodeURIComponent(patientId)}&id=eq.${encodeURIComponent(medicationId)}&limit=1`,
+  );
+  if (!medication) throw new Error("medication_not_found");
+
+  const when = args.scheduledFor || new Date().toISOString();
+  const rows = await sb("medication_events", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({
+      patient_medication_id: medicationId,
+      patient_id: patientId,
+      caregiver_profile_id: caregiverId,
+      scheduled_for: when,
+      status,
+      actual_at: status === "taken" || status === "delayed"
+        ? (args.actualAt || new Date().toISOString())
+        : null,
+      note: clean(args.note, 500) || null,
+      source: "caregiver_app",
+    }),
+  });
+  return rows?.[0] ?? null;
+}
+
+async function saveCareDocument(
+  caregiverId: string,
+  patientId: string,
+  args: Json,
+) {
+  const documentType = clean(args.documentType, 40);
+  if (!["prescription", "medication_box", "lab", "care_plan", "other"].includes(documentType)) {
+    throw new Error("invalid_document_type");
+  }
+  const title = clean(args.title, 220);
+  if (!title) throw new Error("document_title_required");
+
+  const rows = await sb("care_documents", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({
+      patient_id: patientId,
+      uploaded_by_profile_id: caregiverId,
+      document_type: documentType,
+      title,
+      original_file_name: clean(args.originalFileName, 250) || null,
+      extracted_text: clean(args.extractedText, 12000) || null,
+      extraction_json:
+        args.extraction && typeof args.extraction === "object"
+          ? args.extraction
+          : {},
+      reviewed: args.reviewed === true,
+    }),
+  });
+  return rows?.[0] ?? null;
+}
+
+async function recordPatientActivity(
+  caregiverId: string,
+  patientId: string,
+  args: Json,
+) {
+  const type = clean(args.activityType, 80);
+  if (!type) throw new Error("activity_type_required");
+  const rows = await sb("patient_activity_sessions", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({
+      patient_id: patientId,
+      caregiver_profile_id: caregiverId,
+      memory_item_id: clean(args.memoryItemId, 120) || null,
+      activity_type: type,
+      started_at: args.startedAt || new Date().toISOString(),
+      ended_at: args.endedAt || new Date().toISOString(),
+      response_label: clean(args.responseLabel, 100) || null,
+      note: clean(args.note, 1000) || null,
+      metadata:
+        args.metadata && typeof args.metadata === "object"
+          ? args.metadata
+          : {},
+    }),
+  });
+  return rows?.[0] ?? null;
+}
+
+function buildCareSummary(context: Json, summaryType: string) {
+  const patient = context.patient || {};
+  const name = clean(patient.preferred_name || patient.display_name, 120) || "Patient";
+  const meds = Array.isArray(context.medications) ? context.medications : [];
+  const events = Array.isArray(context.medicationEvents) ? context.medicationEvents : [];
+  const appointments = Array.isArray(context.appointments) ? context.appointments : [];
+  const tasks = Array.isArray(context.careTasks) ? context.careTasks : [];
+  const timeline = Array.isArray(context.timeline) ? context.timeline : [];
+
+  const taken = events.filter((e) => e.status === "taken").length;
+  const skipped = events.filter((e) => e.status === "skipped").length;
+  const delayed = events.filter((e) => e.status === "delayed").length;
+  const upcoming = appointments
+    .filter((a) => a.scheduled_for && new Date(a.scheduled_for).getTime() >= Date.now())
+    .slice(0, 3);
+  const openTasks = tasks.filter((t) => !["completed", "cancelled"].includes(t.status)).length;
+  const recent = timeline.slice(0, 3);
+
+  const lines = [
+    `Hani Maak — ${summaryType === "weekly" ? "Weekly" : "Daily"} summary for ${name}`,
+    "",
+    `Active medications: ${meds.length}`,
+    `Medication activity: ${taken} taken · ${skipped} skipped · ${delayed} delayed`,
+    `Open care tasks: ${openTasks}`,
+  ];
+
+  if (upcoming.length) {
+    lines.push("", "Upcoming appointments:");
+    for (const appointment of upcoming) {
+      const when = appointment.scheduled_for
+        ? new Date(appointment.scheduled_for).toLocaleString("en-GB", {
+            timeZone: "Africa/Tunis",
+          })
+        : "date pending";
+      lines.push(`- ${when}: ${clean(appointment.reason, 180) || "Care appointment"}`);
+    }
+  }
+
+  if (recent.length) {
+    lines.push("", "Recent shared care updates:");
+    for (const item of recent) {
+      lines.push(`- ${clean(item.title, 180)}${item.summary ? ": " + clean(item.summary, 240) : ""}`);
+    }
+  }
+
+  lines.push(
+    "",
+    "Private caregiver wellbeing and private Hani conversations are not included.",
+  );
+  return lines.join("\n");
+}
+
+async function deliverWhatsAppSummary(
+  caregiverId: string,
+  patientId: string,
+  args: Json,
+) {
+  const summaryType = clean(args.summaryType, 40) === "weekly" ? "weekly" : "daily";
+  const recipient = clean(args.recipient, 40) || "21627983305";
+  const context = await loadContext(caregiverId, patientId);
+  const summaryText = buildCareSummary(context, summaryType);
+
+  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
+  const token = process.env.WHATSAPP_ACCESS_TOKEN;
+  const apiVersion = process.env.WHATSAPP_API_VERSION;
+
+  if (!phoneNumberId || !token || !apiVersion) {
+    const rows = await sb("summary_deliveries", {
+      method: "POST",
+      headers: { Prefer: "return=representation" },
+      body: JSON.stringify({
+        caregiver_profile_id: caregiverId,
+        patient_id: patientId,
+        channel: "whatsapp",
+        recipient,
+        summary_type: summaryType,
+        status: "configuration_required",
+        summary_text: summaryText,
+        error: "whatsapp_provider_not_configured",
+        provider_response: {
+          requiredEnvironmentVariables: [
+            "WHATSAPP_PHONE_NUMBER_ID",
+            "WHATSAPP_ACCESS_TOKEN",
+            "WHATSAPP_API_VERSION",
+          ],
+        },
+      }),
+    });
+    return {
+      delivery: rows?.[0] ?? null,
+      sent: false,
+      configurationRequired: true,
+      summaryText,
+      requiredEnvironmentVariables: [
+        "WHATSAPP_PHONE_NUMBER_ID",
+        "WHATSAPP_ACCESS_TOKEN",
+        "WHATSAPP_API_VERSION",
+      ],
+    };
+  }
+
+  const response = await fetch(
+    `https://graph.facebook.com/${apiVersion}/${phoneNumberId}/messages`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify({
+        messaging_product: "whatsapp",
+        to: recipient.replace(/[^0-9]/g, ""),
+        type: "text",
+        text: {
+          preview_url: false,
+          body: summaryText,
+        },
+      }),
+    },
+  );
+  const providerResponse = await response.json().catch(() => ({}));
+  const messageId = providerResponse?.messages?.[0]?.id ?? null;
+  const status = response.ok ? "sent" : "failed";
+  const rows = await sb("summary_deliveries", {
+    method: "POST",
+    headers: { Prefer: "return=representation" },
+    body: JSON.stringify({
+      caregiver_profile_id: caregiverId,
+      patient_id: patientId,
+      channel: "whatsapp",
+      recipient,
+      summary_type: summaryType,
+      status,
+      summary_text: summaryText,
+      provider_message_id: messageId,
+      provider_response: providerResponse,
+      error: response.ok ? null : clean(providerResponse?.error?.message, 1000) || "whatsapp_send_failed",
+      sent_at: response.ok ? new Date().toISOString() : null,
+    }),
+  });
+
+  return {
+    delivery: rows?.[0] ?? null,
+    sent: response.ok,
+    configurationRequired: false,
+    summaryText,
+    providerResponse,
+  };
+}
+
+export async function GET(req: Request) {
+  try {
+    const url = new URL(req.url);
+    const caregiverId = clean(url.searchParams.get("caregiverId"), 120);
+    const patientId = clean(url.searchParams.get("patientId"), 120);
+    if (!caregiverId || !patientId) return json({ error: "caregiver_and_patient_required" }, { status: 400 });
+    await verifyIdentity(req, caregiverId, patientId);
+    return json({ success: true, data: await loadContext(caregiverId, patientId) });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "caregiver_context_failed";
+    const status = /authentication|session|identity|access_denied/.test(message) ? 401 : /not_found/.test(message) ? 404 : 500;
+    console.error("Caregiver app context failed", message);
+    return json({ success: false, error: message }, { status });
+  }
+}
+
+export async function POST(req: Request) {
+  try {
+    const body = await req.json().catch(() => ({}));
+    const caregiverId = clean(body.caregiverId, 120);
+    const patientId = clean(body.patientId, 120);
+    const action = clean(body.action, 80);
+    const args = (body.args && typeof body.args === "object" ? body.args : {}) as Json;
+    if (!caregiverId || !patientId) return json({ error: "caregiver_and_patient_required" }, { status: 400 });
+    await verifyIdentity(req, caregiverId, patientId);
+    const grants = await first(`caregiver_patient_relationships?select=caregiver_role,can_view_medications,can_manage_tasks,can_request_professional_help&caregiver_profile_id=eq.${encodeURIComponent(caregiverId)}&patient_id=eq.${encodeURIComponent(patientId)}&access_status=eq.active&limit=1`);
+    if (!grants) throw new Error("caregiver_patient_access_denied");
+    if (!canPerformCaregiverAction(grants, action)) return json({ error: "caregiver_permission_denied" }, { status: 403 });
+
+    if (action === "get_questionnaire") {
+      const versionId = clean(args.versionId, 120);
+      if (!versionId) return json({ error: "questionnaire_version_required" }, { status: 400 });
+      return json({ success: true, questionnaire: await getQuestionnaire(versionId) });
+    }
+    if (action === "submit_questionnaire") {
+      const versionId = clean(args.versionId, 120);
+      const answers = Array.isArray(args.answers) ? args.answers as Json[] : [];
+      if (!versionId) return json({ error: "questionnaire_version_required" }, { status: 400 });
+      return json({
+        success: true,
+        ...(await submitQuestionnaire(caregiverId, patientId, versionId, answers)),
+      });
+    }
+    if (action === "record_wellbeing_checkin") {
+      const rows = await sb("wellbeing_checkins", {
+        method: "POST",
+        headers: { Prefer: "return=representation" },
+        body: JSON.stringify({
+          caregiver_profile_id: caregiverId,
+          patient_id: patientId,
+          mood_label: clean(args.moodLabel, 80) || null,
+          energy_label: clean(args.energyLabel, 80) || null,
+          sleep_label: clean(args.sleepLabel, 80) || null,
+          free_text: clean(args.freeText, 1200) || null,
+          source: "manual",
+        }),
+      });
+      return json({ success: true, checkin: rows?.[0] ?? null, private: true });
+    }
+    if (action === "create_care_task") {
+      return json({
+        success: true,
+        ...(await createCareTask(caregiverId, patientId, args)),
+      });
+    }
+    if (action === "respond_task_request") {
+      return json({ success: true, request: await respondTask(caregiverId, clean(args.requestId, 120), args) });
+    }
+    if (action === "update_notification_preferences") {
+      return json({ success: true, preferences: await updatePreferences(caregiverId, args) });
+    }
+    if (action === "update_app_preferences") {
+      return json({ success: true, profile: await updateAppPreferences(caregiverId, args) });
+    }
+    if (action === "register_push_token") {
+      return json({
+        success: true,
+        device: await registerPushToken(caregiverId, args),
+      });
+    }
+    if (action === "create_medication") {
+      return json({
+        success: true,
+        medication: await createMedication(caregiverId, patientId, args),
+      });
+    }
+    if (action === "record_medication_event") {
+      return json({
+        success: true,
+        event: await recordMedicationEvent(caregiverId, patientId, args),
+      });
+    }
+    if (action === "save_care_document") {
+      return json({
+        success: true,
+        document: await saveCareDocument(caregiverId, patientId, args),
+      });
+    }
+    if (action === "record_patient_activity") {
+      return json({
+        success: true,
+        activity: await recordPatientActivity(caregiverId, patientId, args),
+      });
+    }
+    if (action === "send_whatsapp_summary") {
+      if (!mayRequestProfessionalHelp(grants)) return json({ error: "caregiver_permission_denied" }, { status: 403 });
+      // Demo users can preview the exact summary without contacting real recipients.
+      const demoProfile = await first(
+        `profiles?select=is_demo&id=eq.${encodeURIComponent(caregiverId)}&limit=1`,
+      );
+      if (demoProfile?.is_demo === true) {
+        const context = await loadContext(caregiverId, patientId);
+        return json({
+          success: true,
+          sent: false,
+          simulated: true,
+          configurationRequired: true,
+          summaryText: buildCareSummary(context, clean(args.summaryType, 40) === "weekly" ? "weekly" : "daily"),
+        });
+      }
+      return json({
+        success: true,
+        ...(await deliverWhatsAppSummary(caregiverId, patientId, args)),
+      });
+    }
+    if (action === "preview_summary") {
+      if (!mayRequestProfessionalHelp(grants)) return json({ error: "caregiver_permission_denied" }, { status: 403 });
+      const context = await loadContext(caregiverId, patientId);
+      return json({
+        success: true,
+        summaryText: buildCareSummary(
+          context,
+          clean(args.summaryType, 40) === "weekly" ? "weekly" : "daily",
+        ),
+      });
+    }
+    if (action === "open_notification") {
+      const id = clean(args.notificationId, 120);
+      const rows = await sb(
+        `caregiver_notifications?id=eq.${encodeURIComponent(id)}&caregiver_profile_id=eq.${encodeURIComponent(caregiverId)}`,
+        {
+          method: "PATCH",
+          headers: { Prefer: "return=representation" },
+          body: JSON.stringify({ opened_at: new Date().toISOString() }),
+        },
+      );
+      return json({ success: true, notification: rows?.[0] ?? null });
+    }
+
+    return json({ error: "unsupported_action" }, { status: 400 });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "caregiver_action_failed";
+    const status = /authentication|session|identity|access_denied/.test(message) ? 401 : /not_found/.test(message) ? 404 : /invalid|already/.test(message) ? 400 : 500;
+    console.error("Caregiver app action failed", message);
+    return json({ success: false, error: message }, { status });
+  }
+}

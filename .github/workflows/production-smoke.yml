@@ -1,0 +1,48 @@
+name: Production smoke test
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/production-smoke.yml"
+      - "scripts/production_smoke.py"
+      - "apps/web/**"
+      - "apps/heni-agent/**"
+      - "apps/mobile/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hani-maak-production-smoke
+  cancel-in-progress: true
+
+jobs:
+  smoke:
+    # No secret-bearing test from arbitrary feature branches or forks.
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      HANI_SMOKE_SUPABASE_URL: https://lhrngmuxmjpigycgonnh.supabase.co
+      # Supabase publishable keys are public and already used by the Flutter build.
+      # Never use a service_role/sb_secret_ key here.
+      HANI_SMOKE_SUPABASE_PUBLISHABLE_KEY: sb_publishable_8jxBjLqsE0-8fSxaCZqP7w_7LdAm4SI
+    steps:
+      - name: Wait briefly for production aliases
+        run: sleep 30
+
+      - name: Checkout reviewed main branch
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Prepare WebSocket client
+        run: python3 -m pip install --quiet 'websockets==15.0.1'
+
+      - name: Verify production with authenticated synthetic demo session
+        env:
+          HANI_SMOKE_DEMO_EMAIL: ${{ secrets.HANI_SMOKE_DEMO_EMAIL }}
+          HANI_SMOKE_DEMO_PASSWORD: ${{ secrets.HANI_SMOKE_DEMO_PASSWORD }}
+        run: python3 scripts/production_smoke.py

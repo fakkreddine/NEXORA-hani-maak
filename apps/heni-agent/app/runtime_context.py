@@ -1,0 +1,79 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import time
+from typing import Any
+
+from .heni_prompt import HENI_SYSTEM_PROMPT
+from .tools.hani_backend import call_hani_tool
+
+
+def _usable(result: dict[str, Any]) -> dict[str, Any] | None:
+    if result.get("success") is True:
+        return result
+    return None
+
+
+async def fetch_runtime_context(session) -> dict[str, Any]:
+    """Load authorized context with a short per-session cache for chat speed."""
+    now = time.time()
+    cached = getattr(session, "runtime_context_cache", None)
+    cached_at = float(getattr(session, "runtime_context_cached_at", 0.0) or 0.0)
+    if cached is not None and (now - cached_at) < 45.0:
+        return cached
+    if session.caregiver_id:
+        caregiver = await call_hani_tool(
+            "get_caregiver_context",
+            {},
+            patient_id=session.patient_id,
+            caregiver_id=session.caregiver_id,
+            locale=session.locale,
+            source=session.source,
+        )
+        result = {"caregiver": _usable(caregiver)}
+        session.runtime_context_cache = result
+        session.runtime_context_cached_at = now
+        return result
+
+    patient, hospital = await asyncio.gather(
+        call_hani_tool(
+            "get_patient_context",
+            {},
+            patient_id=session.patient_id,
+            locale=session.locale,
+            source=session.source,
+        ),
+        call_hani_tool(
+            "get_public_hospital_info",
+            {},
+            patient_id=session.patient_id,
+            locale=session.locale,
+            source=session.source,
+        ),
+    )
+    result = {"patient": _usable(patient), "hospital": _usable(hospital)}
+    session.runtime_context_cache = result
+    session.runtime_context_cached_at = now
+    return result
+
+
+def build_runtime_system_prompt(context: dict[str, Any]) -> str:
+    runtime_json = json.dumps(
+        context,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        default=str,
+    )
+    return (
+        HENI_SYSTEM_PROMPT
+        + "\n\nRUNTIME CONTEXT\n"
+        + "The JSON below comes from authenticated/trusted Hani Maak backend tools. "
+        + "For caregiver sessions it contains only the authorized caregiver, linked patient, shared care context, "
+        + "the caregiver's own private wellbeing/context, approved professional information and recent coordination state. "
+        + "Use it actively so the caregiver does not repeat known information. "
+        + "If recentHaniMessages is present, it is the current caregiver's own private recent Hani history; use it for continuity without unnecessarily quoting sensitive text back. "
+        + "Never infer missing clinical facts. Never expose another caregiver's private wellbeing or Hani conversation. "
+        + "If a necessary fact is absent, use an approved tool or ask one concise question.\n"
+        + runtime_json
+    )

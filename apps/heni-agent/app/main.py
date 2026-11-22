@@ -1,0 +1,109 @@
+from __future__ import annotations
+
+from typing import Any
+
+from dotenv import load_dotenv
+from fastapi import FastAPI, Header, HTTPException, WebSocket
+from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+
+load_dotenv()
+
+from .chat_handler import run_chat_turn
+from .config import settings, validate_settings
+from .security import verify_internal_key
+from .voice_handler import handle_voice_connection
+from .ocr_handler import extract_prescription
+
+validate_settings()
+
+app = FastAPI(title="Heni Agent", version="2.0.0", docs_url=None if settings.is_production else "/docs")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=list(settings.allowed_origins),
+    allow_credentials=False,
+    allow_methods=["GET", "POST", "OPTIONS"],
+    allow_headers=["content-type", "x-heni-agent-key"],
+)
+
+
+class ChatMessage(BaseModel):
+    role: str
+    content: str = Field(max_length=4000)
+
+
+class OcrRequest(BaseModel):
+    imageBase64: str = Field(min_length=1, max_length=12000000)
+    mimeType: str = Field(default="image/jpeg", max_length=80)
+    documentType: str = Field(default="prescription", max_length=80)
+    locale: str = Field(default="tn", max_length=20)
+
+
+class ChatRequest(BaseModel):
+    message: str = Field(min_length=1, max_length=2000)
+    locale: str = "ar"
+    patientId: str = Field(min_length=1, max_length=120)
+    caregiverId: str | None = Field(default=None, max_length=120)
+    source: str = "website"
+    sessionId: str | None = None
+    confirmationToken: str | None = Field(default=None, max_length=12000)
+    history: list[ChatMessage] = Field(default_factory=list, max_length=20)
+
+
+@app.get("/health")
+async def health() -> dict[str, Any]:
+    return {
+        "status": "ok",
+        "service": "heni-agent",
+        "mode": "caregiver-ready",
+        "textModel": settings.text_model,
+        "liveModel": settings.live_model,
+        "emotionAnalysisEnabled": settings.emotion_analysis_enabled,
+        "emotionServiceConfigured": bool(
+            settings.emotion_service_url and settings.emotion_service_secret
+        ),
+    }
+
+
+@app.post("/v1/chat")
+async def chat(body: ChatRequest, x_heni_agent_key: str | None = Header(default=None)) -> dict[str, Any]:
+    if not verify_internal_key(x_heni_agent_key):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    return await run_chat_turn(
+        message=body.message.strip(),
+        patient_id=body.patientId,
+        caregiver_id=body.caregiverId,
+        locale=body.locale,
+        source=body.source,
+        session_id=body.sessionId,
+        history=[item.model_dump() for item in body.history],
+        confirmation_token=body.confirmationToken,
+    )
+
+
+@app.post("/v1/ocr-prescription")
+async def ocr_prescription(
+    body: OcrRequest,
+    x_heni_agent_key: str | None = Header(default=None),
+) -> dict[str, Any]:
+    if not verify_internal_key(x_heni_agent_key):
+        raise HTTPException(status_code=401, detail="unauthorized")
+    try:
+        return await extract_prescription(
+            image_base64=body.imageBase64,
+            mime_type=body.mimeType,
+            document_type=body.documentType,
+            locale=body.locale,
+        )
+    except ValueError as error:
+        raise HTTPException(status_code=400, detail=str(error)) from error
+
+
+@app.websocket("/ws/voice")
+async def voice(ws: WebSocket) -> None:
+    await handle_voice_connection(ws)
+
+
+@app.get("/")
+async def root() -> dict[str, str]:
+    return {"service": "Heni Agent", "status": "online"}
